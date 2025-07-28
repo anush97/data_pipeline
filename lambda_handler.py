@@ -17,12 +17,15 @@ from common.decorator import lambda_handler
 logger = logging.getLogger()
 logger.setLevel(os.environ.get("LOG_LEVEL", "INFO"))
 
+
 # Custom exceptions
 class PDFExtractionError(Exception):
     pass
 
+
 class S3PathError(Exception):
     pass
+
 
 def extract_pdf_base64_from_json(json_data: Dict[str, Any]) -> bytes:
     """
@@ -37,23 +40,27 @@ def extract_pdf_base64_from_json(json_data: Dict[str, Any]) -> bytes:
     logger.warning("No PDF data found in Body.content[]. Skipping.")
     return b""
 
+
 def extract_and_clean_text_from_pdf(pdf_bytes: bytes) -> str:
     """
     Use textract to extract and clean text from PDF binary.
     """
+    tmp_pdf_path = Path("/tmp/input.pdf")
     try:
-        tmp_pdf_path = Path("/tmp/input.pdf")
         tmp_pdf_path.write_bytes(pdf_bytes)
         raw_bytes = textract.process(str(tmp_pdf_path))
         raw_text = raw_bytes.decode("utf-8")
-
         # Clean text
         lines = raw_text.splitlines()
         cleaned = [line.strip() for line in lines if line.strip()]
         return "\n".join(cleaned)
     except Exception as e:
         logger.exception("PDF extraction failed")
-        raise PDFExtractionError("Failed to extract or clean PDF content") from e
+        raise PDFExtractionError("Failed to extract or clean PDF content")
+    finally:
+        if tmp_pdf_path.exists():
+            tmp_pdf_path.unlink()
+
 
 def build_handler(s3_adapter: S3Adapter):
     bucket = os.environ.get("BUCKET_NAME")
@@ -70,7 +77,9 @@ def build_handler(s3_adapter: S3Adapter):
         ],
         logging_fn=logger.error,
     )
-    def handler(event: Dict[str, Any], context: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    def handler(
+        event: Dict[str, Any], context: Optional[Dict[str, Any]] = None
+    ) -> Dict[str, Any]:
         logger.info(f"Received event: {json.dumps(event)}")
 
         # Validate input
@@ -120,6 +129,7 @@ def build_handler(s3_adapter: S3Adapter):
         return result
 
     return handler
+
 
 # Register handler unless in test mode
 if not bool(os.environ.get("TEST_FLAG", False)):
