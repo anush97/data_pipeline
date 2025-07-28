@@ -1,138 +1,136 @@
-import json
-import logging
-import os
-import uuid
 import base64
-from pathlib import Path
-from typing import Dict, Any, Optional
+import json
+import pytest
+import boto3
+from moto import mock_aws
+from unittest.mock import patch
+from lambdas.pdf_text_extractor.pdf_text_extractor_handler import (
+    build_handler,
+    extract_pdf_base64_from_json,
+    extract_and_clean_text_from_pdf,
+    PDFExtractionError,
+)
+from lambdas.pdf_text_extractor.s3_adapter import S3Adapter
 
-import textract
-from pydantic import ValidationError
+TEST_BUCKET = "test-bucket"
+TEST_PREFIX = "flattened"
 
-from .metadata_model import NewMetadata
-from .s3_adapter import S3Adapter, create_s3_client
-from common.decorator import lambda_handler
-
-# Logger setup
-logger = logging.getLogger()
-logger.setLevel(os.environ.get("LOG_LEVEL", "INFO"))
-
-
-# Custom exceptions
-class PDFExtractionError(Exception):
-    pass
-
-
-class S3PathError(Exception):
-    pass
+# ---------------- Fixtures ---------------- #
 
 
-def extract_pdf_base64_from_json(json_data: Dict[str, Any]) -> bytes:
-    """
-    Extracts the base64-encoded PDF binary from the S3-stored JSON structure.
-    """
-    content_blocks = json_data.get("Body", {}).get("content", [])
-    for block in content_blocks:
-        if block.get("contentType", "").startswith("application/pdf"):
-            base64_data = block.get("data")
-            if base64_data:
-                return base64.b64decode(base64_data)
-    logger.warning("No PDF data found in Body.content[]. Skipping.")
-    return b""
+@pytest.fixture(scope="module", autouse=True)
+def setup_env():
+    import os
+
+    os.environ["BUCKET_NAME"] = TEST_BUCKET
+    os.environ["PROCESSED_TEXT_PREFIX"] = TEST_PREFIX
+    os.environ["LOG_LEVEL"] = "INFO"
 
 
-def extract_and_clean_text_from_pdf(pdf_bytes: bytes) -> str:
-    """
-    Use textract to extract and clean text from PDF binary.
-    """
-    tmp_pdf_path = Path("/tmp/input.pdf")
-    try:
-        tmp_pdf_path.write_bytes(pdf_bytes)
-        raw_bytes = textract.process(str(tmp_pdf_path))
-        raw_text = raw_bytes.decode("utf-8")
-        # Clean text
-        lines = raw_text.splitlines()
-        cleaned = [line.strip() for line in lines if line.strip()]
-        return "\n".join(cleaned)
-    except Exception as e:
-        logger.exception("PDF extraction failed")
-        raise PDFExtractionError("Failed to extract or clean PDF content")
-    finally:
-        if tmp_pdf_path.exists():
-            tmp_pdf_path.unlink()
-
-
-def build_handler(s3_adapter: S3Adapter):
-    bucket = os.environ.get("BUCKET_NAME")
-    prefix = os.environ.get("PROCESSED_TEXT_PREFIX")
-
-    if not bucket or not prefix:
-        raise EnvironmentError("Missing BUCKET_NAME or PROCESSED_TEXT_PREFIX")
-
-    @lambda_handler(
-        error_status=[
-            (ValidationError, 400),
-            (PDFExtractionError, 500),
-            (S3PathError, 400),
-        ],
-        logging_fn=logger.error,
-    )
-    def handler(
-        event: Dict[str, Any], context: Optional[Dict[str, Any]] = None
-    ) -> Dict[str, Any]:
-        logger.info(f"Received event: {json.dumps(event)}")
-
-        # Validate input
-        try:
-            model = NewMetadata(**event)
-        except ValidationError as e:
-            raise e
-
-        if model.content_type != "pdf":
-            logger.info(f"Skipping non-PDF content_type={model.content_type}")
-            return event
-
-        # Parse raw_path: s3://bucket/key
-        raw_path = model.raw_path
-        if not raw_path.startswith("s3://"):
-            raise S3PathError(f"Invalid raw_path format: {raw_path}")
-
-        _, s3_path = raw_path.split("s3://", 1)
-        raw_bucket, raw_key = s3_path.split("/", 1)
-
-        # Read and parse the JSON document from S3
-        response = s3_adapter.try_get_object(raw_bucket, raw_key)
-        json_doc = json.loads(response["Body"].read().decode("utf-8"))
-
-        # Extract base64 PDF from JSON
-        pdf_bytes = extract_pdf_base64_from_json(json_doc)
-        if not pdf_bytes:
-            logger.warning("Empty PDF content. Skipping document.")
-            return event
-
-        # Extract and clean text from PDF
-        cleaned_text = extract_and_clean_text_from_pdf(pdf_bytes)
-
-        # Save cleaned text to S3
-        txt_key = f"{prefix}/{uuid.uuid4()}.txt"
-        s3_adapter.s3_client.put_object(
-            Bucket=bucket,
-            Key=txt_key,
-            Body=cleaned_text.encode("utf-8"),
-            ContentType="text/plain",
+@pytest.fixture
+def s3_mock():
+    with mock_aws():
+        client = boto3.client("s3", region_name="ca-central-1")
+        client.create_bucket(
+            Bucket=TEST_BUCKET,
+            CreateBucketConfiguration={"LocationConstraint": "ca-central-1"},
         )
-        logger.info(f"Saved cleaned text to: s3://{bucket}/{txt_key}")
-
-        # Return enriched result
-        result = event.copy()
-        result["content_path"] = f"s3://{bucket}/{txt_key}"
-        return result
-
-    return handler
+        yield client
 
 
-# Register handler unless in test mode
-if not bool(os.environ.get("TEST_FLAG", False)):
-    _s3 = create_s3_client()
-    _s3_adapter = S3Adapter(_s3)
-    handler = build_handler(_s3_adapter)
+@pytest.fixture
+def s3_adapter(s3_mock):
+    return S3Adapter(s3_mock)
+
+
+@pytest.fixture
+def valid_event():
+    return {
+        "metadata": {
+            "@unid": "12345",
+            "region": "ON",
+            "Province": "Ontario",
+            "res_title": "MyTitle",
+            "file_name": "12345__MyTitle.pdf",
+            "url": "http://example.com",
+            "Subject": "Test",
+            "CategoryV2": "Cat",
+            "SectionNameV2": "Sec",
+            "SubSectionNameV2": "SubSec",
+            "Langue": "en",
+            "Status": "Published",
+        },
+        "raw_path": f"s3://{TEST_BUCKET}/inputs/test.json",
+        "content_type": "pdf",
+    }
+
+
+@pytest.fixture
+def sample_pdf_json():
+    fake_pdf = base64.b64encode(b"Fake PDF content for testing\nAnother Line").decode(
+        "utf-8"
+    )
+    return {"Body": {"content": [{"contentType": "application/pdf", "data": fake_pdf}]}}
+
+
+# ---------------- Tests ---------------- #
+
+
+def test_extract_pdf_base64_success(sample_pdf_json):
+    result = extract_pdf_base64_from_json(sample_pdf_json)
+    assert isinstance(result, bytes)
+
+
+def test_pdf_cleaning_logic():
+    with patch("textract.process") as mock_textract:
+        mock_textract.return_value = b"Line1\n\nLine2  \n   \nLine3"
+        result = extract_and_clean_text_from_pdf(b"Fake PDF content")
+        assert "Line1" in result and "Line2" in result and "Line3" in result
+        assert "\n\n" not in result
+
+
+def test_handler_valid_pdf(
+    setup_env, s3_mock, s3_adapter, valid_event, sample_pdf_json
+):
+    s3_mock.put_object(
+        Bucket=TEST_BUCKET,
+        Key="inputs/test.json",
+        Body=json.dumps(sample_pdf_json).encode("utf-8"),
+    )
+    handler = build_handler(s3_adapter)
+    with patch(
+        "lambdas.pdf_text_extractor.pdf_text_extractor_handler.textract.process"
+    ) as mock_textract:
+        mock_textract.return_value = b"Line1\n\nLine2\nLine3"
+        result = handler(valid_event, None)
+    assert result["statusCode"] == 200
+    body = json.loads(result["body"])  # Parse the body as JSON
+    assert "content_path" in body
+    assert body["content_type"] == "pdf"
+
+
+def test_handler_skips_non_pdf(setup_env, s3_adapter, valid_event):
+    valid_event["content_type"] = "html"
+    handler = build_handler(s3_adapter)
+    result = handler(valid_event, None)
+    assert "content_path" not in result["body"]
+    assert result["statusCode"] == 200
+
+
+def test_handler_invalid_raw_path(setup_env, s3_adapter, valid_event):
+    valid_event["raw_path"] = "invalid-path"
+    handler = build_handler(s3_adapter)
+    result = handler(valid_event, None)
+    assert result["statusCode"] == 400
+
+
+def test_handler_invalid_metadata_format(setup_env, s3_adapter):
+    handler = build_handler(s3_adapter)
+    result = handler({"foo": "bar"}, None)
+    assert result["statusCode"] == 400
+    assert "validation errors" in result["body"]
+
+
+def test_pdf_extraction_failure():
+    with pytest.raises(PDFExtractionError):
+        extract_and_clean_text_from_pdf(b"not-a-real-pdf")
